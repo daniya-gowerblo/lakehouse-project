@@ -2,30 +2,98 @@ import polars as pl
 from deltalake import DeltaTable, write_deltalake
 from src.config import SILVER_PATH, BRONZE_PATH
 
+
+def _pick(schema, *names):
+    for name in names:
+        if name in schema:
+            return name
+    raise ValueError(f"None of these columns were found in Bronze: {names}")
+
+
+def _pick_optional(schema, *names):
+    for name in names:
+        if name in schema:
+            return name
+    return None
+
+
+def _normalize_code(column_name):
+    return pl.col(column_name).cast(pl.Utf8).str.strip_chars().str.to_uppercase()
+
+
 def process_silver():
     print("  Reading Bronze...")
     df = pl.scan_delta(str(BRONZE_PATH))
+    schema = df.collect_schema().names()
+
+    year_col = _pick(schema, "Year", "YEAR")
+    month_col = _pick(schema, "Month", "MONTH")
+    day_col = "DAY" if "DAY" in schema else None
+    day_of_week_col = _pick(schema, "DayOfWeek", "DAY_OF_WEEK")
+    cancelled_col = _pick(schema, "Cancelled", "CANCELLED")
+    diverted_col = _pick_optional(schema, "Diverted", "DIVERTED")
+    airline_col = _pick(schema, "IATA_Code_Marketing_Airline", "AIRLINE")
+    flight_number_col = _pick(schema, "Flight_Number_Marketing_Airline", "FLIGHT_NUMBER")
+    origin_col = _pick(schema, "Origin", "ORIGIN_AIRPORT")
+    dest_col = _pick(schema, "Dest", "DESTINATION_AIRPORT")
+    crs_dep_time_col = _pick(schema, "CRSDepTime", "SCHEDULED_DEPARTURE")
+    dep_delay_col = _pick(schema, "DepDelay", "DEPARTURE_DELAY")
+    crs_arr_time_col = _pick(schema, "CRSArrTime", "SCHEDULED_ARRIVAL")
+    arr_delay_col = _pick(schema, "ArrDelay", "ARRIVAL_DELAY")
+    distance_col = _pick(schema, "Distance", "DISTANCE")
+
+    if "FlightDate" in schema:
+        flight_date_expr = pl.col("FlightDate").cast(pl.Utf8).alias("flight_date")
+    elif day_col:
+        flight_date_expr = pl.concat_str([
+            pl.col(year_col).cast(pl.Utf8),
+            pl.lit("-"),
+            pl.col(month_col).cast(pl.Utf8),
+            pl.lit("-"),
+            pl.col(day_col).cast(pl.Utf8),
+        ]).alias("flight_date")
+    else:
+        flight_date_expr = pl.concat_str([
+            pl.col(year_col).cast(pl.Utf8),
+            pl.lit("-"),
+            pl.col(month_col).cast(pl.Utf8),
+        ]).alias("flight_date")
     
     df_clean = (
         df
         .filter(
-            (pl.col("Cancelled") == 0) & 
-            (pl.col("ArrDelay").is_not_null())
+            (pl.col(cancelled_col) == 0) &
+            ((pl.col(diverted_col) == 0) if diverted_col else pl.lit(True)) &
+            (pl.col(arr_delay_col).is_not_null()) &
+            (pl.col(arr_delay_col).is_between(-60, 360))
         )
         .with_columns([
-            (pl.col("CRSDepTime") // 100).cast(pl.Int8).alias("hour"),
-            pl.when(pl.col("Month").is_in([12, 1, 2])).then(pl.lit("Winter"))
-             .when(pl.col("Month").is_in([3, 4, 5])).then(pl.lit("Spring"))
-             .when(pl.col("Month").is_in([6, 7, 8])).then(pl.lit("Summer"))
+            (pl.col(crs_dep_time_col) // 100).cast(pl.Int8).alias("hour"),
+            pl.when(pl.col(month_col).is_in([12, 1, 2])).then(pl.lit("Winter"))
+             .when(pl.col(month_col).is_in([3, 4, 5])).then(pl.lit("Spring"))
+             .when(pl.col(month_col).is_in([6, 7, 8])).then(pl.lit("Summer"))
              .otherwise(pl.lit("Autumn")).alias("season"),
-            pl.concat_str([pl.col("Origin"), pl.lit("-"), pl.col("Dest")]).alias("route")
+            _normalize_code(airline_col).alias("airline"),
+            _normalize_code(origin_col).alias("origin"),
+            _normalize_code(dest_col).alias("dest"),
         ])
-        .rename({"Year": "year", "Month": "month"})
+        .with_columns([
+            pl.concat_str([pl.col("origin"), pl.lit("-"), pl.col("dest")]).alias("route")
+        ])
         .select([
-            "FlightDate", "year", "month", "DayOfWeek",
-            "IATA_Code_Marketing_Airline", "Flight_Number_Marketing_Airline",
-            "Origin", "Dest", "CRSDepTime", "DepDelay",
-            "CRSArrTime", "ArrDelay", "Distance",
+            flight_date_expr,
+            pl.col(year_col).alias("year"),
+            pl.col(month_col).alias("month"),
+            pl.col(day_of_week_col).alias("day_of_week"),
+            "airline",
+            pl.col(flight_number_col).alias("flight_number"),
+            "origin",
+            "dest",
+            pl.col(crs_dep_time_col).alias("crs_dep_time"),
+            pl.col(dep_delay_col).alias("dep_delay"),
+            pl.col(crs_arr_time_col).alias("crs_arr_time"),
+            pl.col(arr_delay_col).alias("arr_delay"),
+            pl.col(distance_col).alias("distance"),
             "hour", "season", "route"
         ])
     )
@@ -36,7 +104,7 @@ def process_silver():
         print("  No data after filtering.")
         return
 
-    merge_keys = ["FlightDate", "IATA_Code_Marketing_Airline", "Flight_Number_Marketing_Airline", "Origin", "Dest"]
+    merge_keys = ["flight_date", "airline", "flight_number", "origin", "dest"]
     df_new = df_new.unique(subset=merge_keys, keep="first")
     print(f"  Deduplicated source data. Rows: {len(df_new)}")
 
@@ -48,7 +116,7 @@ def process_silver():
         predicate = " AND ".join([f"target.{k} = source.{k}" for k in merge_keys])
         
         dt.merge(
-            source=df_new, 
+            source=df_new.to_arrow(), 
             predicate=predicate, 
             source_alias="source", 
             target_alias="target"
@@ -62,8 +130,3 @@ def process_silver():
             mode="overwrite"
         )
         print("  Silver created.")
-        
-    try:
-        DeltaTable(str(SILVER_PATH)).vacuum(retention_hours=168) # 7 дней, чтобы избежать ошибки вакуума
-    except Exception as e:
-        pass 
