@@ -8,7 +8,6 @@
 - `notebooks/` - место для исследовательских ноутбуков.
 - `logs/` - служебные выгрузки, включая пример time travel.
 - `data/raw/` - входные CSV-файлы.
-- `data/bronze`, `data/silver`, `data/gold` - локальные Delta-таблицы.
 
 ## Запуск
 
