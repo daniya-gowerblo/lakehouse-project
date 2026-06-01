@@ -13,8 +13,9 @@ services:
       - mlflow
     environment:
       - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - DATA_ROOT=/app/data
     volumes:
-      # Монтируем локальную папку data в контейнер по пути /data
-      - ./data:/data
+      - ./data:/app/data
+      - ./logs:/app/logs
     working_dir: /app
     command: python src/main.py
