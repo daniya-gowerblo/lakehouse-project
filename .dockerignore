@@ -1,0 +1,12 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ipynb_checkpoints
+
+data/bronze
+data/silver
+data/gold
+mlruns
+logs/*.log
